@@ -2,14 +2,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-import google.generativeai as genai
+from google import genai
 import json
 import os
 import re
 
 app = FastAPI()
 
-# CORS設定: フロントエンドからの通信を許可
+# CORS設定（画面側からの通信を許可する設定）
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,11 +22,6 @@ app.add_middleware(
 async def read_index():
     return FileResponse("index.html")
 
-# 🌟 Gemini APIの設定
-# 環境変数 GEMINI_API_KEY があればそれを使用し、なければ直接指定したキーを使用します
-API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyA_jyfC7rhnA1x1h6y6YqP5VX1IcHVOOMc")
-genai.configure(api_key=API_KEY)
-
 # --- データモデル定義 ---
 class IdeaRequest(BaseModel):
     persona: str
@@ -34,45 +29,16 @@ class IdeaRequest(BaseModel):
     action: str
 
 class ChatMessage(BaseModel):
-    role: str # "user" または "ai"
+    role: str
     text: str
 
 class ChatRequest(BaseModel):
     persona: str
-    idea_context: str # タイトルや詳細の要約
-    history: list[ChatMessage] # 会話履歴
-
-# 🌟 モデル名のキャッシュ変数
-_CACHED_MODEL_NAME = None
-
-def get_gemini_model():
-    """利用可能なモデルを自動選択し、キャッシュする関数"""
-    global _CACHED_MODEL_NAME
-    if _CACHED_MODEL_NAME is not None:
-        return genai.GenerativeModel(_CACHED_MODEL_NAME)
-
-    valid_model_name = None
-    try:
-        # 利用可能なモデルの一覧を取得して、generateContentをサポートしているものを探す
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                valid_model_name = m.name.replace('models/', '')
-                # flashモデルがあれば優先的に選択
-                if 'flash' in valid_model_name:
-                    break
-        
-        _CACHED_MODEL_NAME = valid_model_name or 'gemini-1.5-flash'
-        print(f"🤖 使用モデルを選択しました: {_CACHED_MODEL_NAME}")
-        return genai.GenerativeModel(_CACHED_MODEL_NAME)
-    except Exception as e:
-        print(f"🚨 モデル一覧の取得に失敗しました: {e}")
-        # 失敗した場合は標準的な名前をデフォルトとする
-        return genai.GenerativeModel('gemini-1.5-flash')
+    idea_context: str
+    history: list[ChatMessage]
 
 @app.post("/api/generate")
 async def generate_idea(req: IdeaRequest):
-    """キーワードからアイデアを生成するエンドポイント"""
-    # 🧠 非エンジニア向けに専門用語を排除したプロンプト
     prompt = f"""
     あなたは「{req.persona}」です。その視点で、以下のキーワードを掛け合わせた斬新なWebサービスのアイデアを提案してください。
     
@@ -99,32 +65,44 @@ async def generate_idea(req: IdeaRequest):
     }}
     """
     try:
-        model = get_gemini_model()
-        response = model.generate_content(prompt)
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            return {"error": "APIキーが設定されていません。Vercelの環境変数を確認してください。"}
+            
+        # 最新のSDKでの呼び出し方
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model='gemini-2.5-flash', # 最新の高速モデル
+            contents=prompt,
+        )
         result_text = response.text.strip()
         
-        # AIがマークダウン形式(```json ... ```)で返してきた場合に中身を抽出する
+        # AIがマークダウン形式で返してきた場合に中身を抽出
         if "```" in result_text:
             match = re.search(r'`{3}(?:json)?\s*(.*?)\s*`{3}', result_text, re.DOTALL)
             if match:
                 result_text = match.group(1)
         
-        # 不要な制御文字などを掃除してJSONとして読み込む
-        data = json.loads(result_text.strip())
+        # 🌟 確実なJSON抽出：波括弧 { } で囲まれた部分だけを強制的に抜き出す（余計な挨拶文字対策）
+        start_idx = result_text.find('{')
+        end_idx = result_text.rfind('}')
+        if start_idx != -1 and end_idx != -1:
+            result_text = result_text[start_idx:end_idx+1]
         
-        # データが不足している場合のフォールバック
+        data = json.loads(result_text)
+        
+        # データが不足している場合のフォールバック（保険）
         if "tags" not in data: data["tags"] = ["新規アイデア"]
         if "workflow" not in data: data["workflow"] = ["AIツールを開く", "指示を出す", "公開する"]
+        if "ai_feasibility" not in data: data["ai_feasibility"] = "【AI完結難易度: 判定不能】AIツールを使えば簡単に作れるはずです！"
         
         return data
     except Exception as e:
         print(f"🚨 生成エラー: {str(e)}")
-        # パースに失敗した場合はエラーメッセージを返す
-        return {"error": "AIの回答を解析できませんでした。もう一度試してみてください。"}
+        return {"error": "AIの回答を解析できませんでした。もう一度お試しください。"}
 
 @app.post("/api/chat")
 async def chat_idea(req: ChatRequest):
-    """生成されたアイデアについて対話（壁打ち）するエンドポイント"""
     prompt = f"""
     あなたは「{req.persona}」です。以下のアイデアについて、プログラミングができないユーザーと一緒に作戦会議（壁打ち）をしています。
     キャラクターになりきって、具体的で簡単なアドバイスをしてください。専門用語は禁止です。
@@ -141,8 +119,15 @@ async def chat_idea(req: ChatRequest):
     prompt += f"\n返答は「{req.persona}」らしい口調で、相手が「自分でも作れる！」とワクワクするような内容にしてください。"
 
     try:
-        model = get_gemini_model()
-        response = model.generate_content(prompt)
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            return {"error": "APIキーが設定されていません。"}
+            
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+        )
         return {"reply": response.text.strip()}
     except Exception as e:
         print(f"🚨 チャットエラー: {str(e)}")
